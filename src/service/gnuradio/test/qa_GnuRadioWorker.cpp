@@ -4,6 +4,7 @@
 #include <majordomo/Worker.hpp>
 #include <zmq/ZmqUtils.hpp>
 
+#include <gnuradio-4.0/fourier/fft.hpp>
 #include <gnuradio-4.0/testing/Delay.hpp>
 
 #include <boost/ut.hpp>
@@ -31,7 +32,9 @@ void registerTestBlocks(Registry& registry) {
 #pragma GCC diagnostic ignored "-Wunused-variable"
     gr::registerBlock<CountSource, double>(registry);
     gr::registerBlock<ForeverSource, double>(registry);
+    gr::registerBlock<gr::basic::DataSetSink, double>(registry);
     gr::registerBlock<gr::basic::DataSink, double>(registry);
+    gr::registerBlock<gr::blocks::fft::DefaultFFT, double>(registry);
     gr::registerBlock<gr::testing::Delay, double>(registry);
 #pragma GCC diagnostic pop
 }
@@ -576,6 +579,66 @@ connections:
 
         // trigger + delay * sample_rate = 50 + 3 * 10 = 80
         expect(eq(receivedData, std::vector{80.f}));
+        expect(eq(lastDnsEntries.size(), 1UZ));
+        if (!lastDnsEntries.empty()) {
+            expect(eq(lastDnsEntries[0].name, "count"sv));
+            expect(eq(lastDnsEntries[0].unit, "A unit"sv));
+            expect(eq(lastDnsEntries[0].sample_rate, 10.f));
+        }
+    };
+
+    "DataSet"_test = [] {
+        constexpr std::string_view grc = R"(
+blocks:
+  - name: count
+    id: CountSource
+    parameters:
+      n_samples: 100000
+      signal_name: test signal
+      signal_unit: test unit
+  - name: delay
+    id: gr::testing::Delay
+    parameters:
+      delay_ms: 600
+  - name: fft
+    id: gr::blocks::fft::FFT
+  - name: test_sink
+    id: gr::basic::DataSetSink
+    parameters:
+      signal_names:
+        - test signal
+        - Re(FFT(test signal))
+        - Im(FFT(test signal))
+        - Magnitude(test signal)
+        - Phase(test signal)
+connnections:
+  - [count, 0, delay, 0]
+  - [delay, 0, fft, 0]
+  - [fft, 0, test_sink, 0]
+)";
+        std::vector<SignalEntry>   lastDnsEntries;
+        TestSetup                  test([&lastDnsEntries](auto entries) {
+            if (!entries.empty()) {
+                lastDnsEntries = std::move(entries);
+            }
+        });
+
+        std::vector<float>       receivedData;
+        std::atomic<std::size_t> receivedCount = 0;
+
+        test.subscribeClient(URI("mds://127.0.0.1:12345/GnuRadio/Acquisition?channelNameFilter=Im%28FFT%28test%20signal%29%29&acquisitionModeFilter=dataset"), [&receivedData, &receivedCount](const auto& acq) {
+            fmt::println("Got a set with {} samples", acq.channelValue.size());
+            expect(acq.acqTriggerName.value() == "start");
+            receivedData.insert(receivedData.end(), acq.channelValue.begin(), acq.channelValue.end());
+            receivedCount = receivedData.size();
+        });
+
+        std::this_thread::sleep_for(50ms);
+        test.setGrc(grc);
+
+        waitWhile([&receivedCount] { return receivedCount < 20; });
+
+        expect(eq(receivedData, getIota(20, 50)));
         expect(eq(lastDnsEntries.size(), 1UZ));
         if (!lastDnsEntries.empty()) {
             expect(eq(lastDnsEntries[0].name, "count"sv));

@@ -69,7 +69,7 @@ using enum gr::message::Command;
 using namespace opencmw::majordomo;
 using namespace std::chrono_literals;
 
-enum class AcquisitionMode { Continuous, Triggered, Multiplexed, Snapshot };
+enum class AcquisitionMode { Continuous, Triggered, Multiplexed, Snapshot, DataSet };
 
 constexpr inline AcquisitionMode parseAcquisitionMode(std::string_view v) {
     using enum AcquisitionMode;
@@ -84,6 +84,9 @@ constexpr inline AcquisitionMode parseAcquisitionMode(std::string_view v) {
     }
     if (v == "snapshot") {
         return Snapshot;
+    }
+    if (v == "dataset") {
+        return DataSet;
     }
     throw std::invalid_argument(fmt::format("Invalid acquisition mode '{}'", v));
 }
@@ -101,15 +104,15 @@ struct PollerKey {
 };
 
 struct StreamingPollerEntry {
-    using SampleType                                                = double;
-    bool                                                     in_use = true;
-    std::shared_ptr<gr::basic::DataSink<SampleType>::Poller> poller;
-    std::optional<std::string>                               signal_name;
-    std::optional<std::string>                               signal_unit;
-    std::optional<float>                                     signal_min;
-    std::optional<float>                                     signal_max;
+    using SampleType                                               = double;
+    bool                                                    in_use = true;
+    std::shared_ptr<gr::basic::StreamingPoller<SampleType>> poller;
+    std::optional<std::string>                              signal_name;
+    std::optional<std::string>                              signal_unit;
+    std::optional<float>                                    signal_min;
+    std::optional<float>                                    signal_max;
 
-    explicit StreamingPollerEntry(std::shared_ptr<basic::DataSink<SampleType>::Poller> p) : poller{p} {}
+    explicit StreamingPollerEntry(std::shared_ptr<basic::StreamingPoller<SampleType>> p) : poller{p} {}
 
     void populateFromTags(std::span<const gr::Tag>& tags) {
         for (const auto& tag : tags) {
@@ -139,8 +142,8 @@ struct SignalEntry {
 
 struct DataSetPollerEntry {
     using SampleType = double;
-    std::shared_ptr<gr::basic::DataSink<SampleType>::DataSetPoller> poller;
-    bool                                                            in_use = false;
+    std::shared_ptr<gr::basic::DataSetPoller<SampleType>> poller;
+    bool                                                  in_use = false;
 };
 
 template<units::basic_fixed_string serviceName, typename... Meta>
@@ -441,6 +444,9 @@ private:
                 pollerIt = pollers.emplace(key, basic::DataSinkRegistry::instance().getSnapshotPoller<double>(query, std::move(matcher), key.snapshot_delay)).first;
             } else if (mode == AcquisitionMode::Multiplexed) {
                 pollerIt = pollers.emplace(key, basic::DataSinkRegistry::instance().getMultiplexedPoller<double>(query, std::move(matcher), key.maximum_window_size)).first;
+            } else if (mode == AcquisitionMode::DataSet) {
+                pollerIt = pollers.emplace(key, basic::DataSinkRegistry::instance().getDataSetPoller<double>(query)).first;
+                fmt::println("got a poller for '{}': {}", signalName, pollerIt->second.poller != nullptr);
             }
         }
         return pollerIt;
@@ -460,24 +466,40 @@ private:
         }
         Acquisition reply;
         auto        processData = [&reply, &key, signalName, &pollerEntry](std::span<const gr::DataSet<double>> dataSets) {
+            fmt::println("received {} datasets", dataSets.size());
             const auto& dataSet = dataSets[0];
-            if (!dataSet.timing_events.empty()) {
-                reply.acqTriggerName = detail::findTriggerName(dataSet.timing_events[0]);
+            const auto  signal_it = std::ranges::find(dataSet.signal_names, signalName);
+            if (key.mode == AcquisitionMode::DataSet && signal_it == dataSet.signal_names.end()) {
+                return;
             }
-            reply.channelName = dataSet.signal_names.empty() ? std::string(signalName) : dataSet.signal_names[0];
-            reply.channelUnit = dataSet.signal_units.empty() ? "N/A" : dataSet.signal_units[0];
-            if (!dataSet.signal_ranges.empty() && dataSet.signal_ranges[0].size() == 2) {
+            const auto signal_idx = signal_it == dataSet.signal_names.end() ? 0UZ : std::distance(dataSet.signal_names.begin(), signal_it);
+            if (!dataSet.timing_events.empty()) {
+                reply.acqTriggerName = detail::findTriggerName(dataSet.timing_events[signal_idx]);
+            }
+            reply.channelName = dataSet.signal_names.empty() ? std::string(signalName) : dataSet.signal_names[signal_idx];
+            reply.channelUnit = (dataSet.signal_units.size() < signal_idx - 1) ? "N/A" : dataSet.signal_units[signal_idx];
+            if ((dataSet.signal_ranges.size() >= signal_idx) && dataSet.signal_ranges[signal_idx].size() == 2) {
                 // Workaround for Annotated, see above
-                const typename decltype(reply.channelRangeMin)::R rangeMin = dataSet.signal_ranges[0][0];
-                const typename decltype(reply.channelRangeMax)::R rangeMax = dataSet.signal_ranges[0][1];
+                const typename decltype(reply.channelRangeMin)::R rangeMin = dataSet.signal_ranges[signal_idx][0];
+                const typename decltype(reply.channelRangeMax)::R rangeMax = dataSet.signal_ranges[signal_idx][1];
                 reply.channelRangeMin                                      = rangeMin;
                 reply.channelRangeMax                                      = rangeMax;
             }
-            reply.channelValue.resize(dataSet.signal_values.size());
-            std::transform(dataSet.signal_values.begin(), dataSet.signal_values.end(), reply.channelValue.begin(), detail::doubleToFloat);
-            reply.channelError.resize(dataSet.signal_errors.size());
-            std::transform(dataSet.signal_errors.begin(), dataSet.signal_errors.end(), reply.channelError.begin(), detail::doubleToFloat);
-            reply.channelTimeBase.resize(dataSet.signal_values.size());
+            auto values = std::span(dataSet.signal_values);
+            auto errors = std::span(dataSet.signal_errors);
+
+            if (key.mode == AcquisitionMode::DataSet) {
+                const auto samples = static_cast<std::size_t>(dataSet.extents[1]); // TODO any reason why extents is signed? Do I need to handle the < 0 case?
+                const auto offset  = signal_idx * samples;
+                values             = values.subspan(offset, samples);
+                errors             = errors.subspan(offset, samples);
+            }
+
+            reply.channelValue.resize(values.size());
+            std::ranges::transform(values, reply.channelValue.begin(), detail::doubleToFloat);
+            reply.channelError.resize(errors.size());
+            std::ranges::transform(errors, reply.channelError.begin(), detail::doubleToFloat);
+            reply.channelTimeBase.resize(values.size());
             std::fill(reply.channelTimeBase.begin(), reply.channelTimeBase.end(), 0); // TODO
         };
         pollerEntry.in_use = true;
