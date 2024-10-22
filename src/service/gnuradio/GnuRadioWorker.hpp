@@ -189,13 +189,13 @@ private:
             auto update = std::chrono::system_clock::now();
             // TODO: current load_grc creates Foo<double> types no matter what the original type was
             // when supporting more types, we need some type erasure here
-            std::map<PollerKey, StreamingPollerEntry> streamingPollers;
-            std::map<PollerKey, DataSetPollerEntry>   dataSetPollers;
-            std::jthread                              schedulerThread;
-            std::string                               schedulerUniqueName;
-            std::map<std::string, SignalEntry>        signalEntryBySink;
-            std::unique_ptr<MsgPortOut>               toScheduler;
-            std::unique_ptr<MsgPortIn>                fromScheduler;
+            std::map<PollerKey, StreamingPollerEntry>       streamingPollers;
+            std::map<PollerKey, DataSetPollerEntry>         dataSetPollers;
+            std::jthread                                    schedulerThread;
+            std::string                                     schedulerUniqueName;
+            std::map<std::string, std::vector<SignalEntry>> signalEntriesBySink;
+            std::unique_ptr<MsgPortOut>                     toScheduler;
+            std::unique_ptr<MsgPortIn>                      fromScheduler;
 
             bool finished = false;
 
@@ -227,30 +227,39 @@ private:
                                 continue;
                             }
                         } else if (message.endpoint == block::property::kSetting) {
-                            auto sinkIt = signalEntryBySink.find(message.serviceName);
-                            if (sinkIt == signalEntryBySink.end()) {
+                            auto sinkIt = signalEntriesBySink.find(message.serviceName);
+                            if (sinkIt == signalEntriesBySink.end()) {
                                 continue;
                             }
                             const auto& settings = message.data;
                             if (!settings) {
                                 continue;
                             }
-                            auto& entry = sinkIt->second;
+                            auto& entries = sinkIt->second;
 
-                            const auto signal_name = detail::get<std::string>(*settings, "signal_name");
-                            const auto signal_unit = detail::get<std::string>(*settings, "signal_unit");
-                            const auto sample_rate = detail::get<float>(*settings, "sample_rate");
-                            if (signal_name && signal_name != entry.name) {
-                                entry.name        = *signal_name;
-                                signalInfoChanged = true;
-                            }
-                            if (signal_unit && signal_unit != entry.unit) {
-                                entry.unit        = *signal_unit;
-                                signalInfoChanged = true;
-                            }
-                            if (sample_rate && sample_rate != entry.sample_rate) {
-                                entry.sample_rate = *sample_rate;
-                                signalInfoChanged = true;
+                            const auto signal_names = detail::get<std::vector<std::string>>(*settings, "signal_names");
+                            const auto signal_units = detail::get<std::vector<std::string>>(*settings, "signal_units");
+
+                            if (signal_names && signal_units) {
+
+                            } else {
+                                entries.resize(1);
+                                auto&      entry       = entries[0];
+                                const auto signal_name = detail::get<std::string>(*settings, "signal_name");
+                                const auto signal_unit = detail::get<std::string>(*settings, "signal_unit");
+                                const auto sample_rate = detail::get<float>(*settings, "sample_rate");
+                                if (signal_name && signal_name != entry.name) {
+                                    entry.name        = *signal_name;
+                                    signalInfoChanged = true;
+                                }
+                                if (signal_unit && signal_unit != entry.unit) {
+                                    entry.unit        = *signal_unit;
+                                    signalInfoChanged = true;
+                                }
+                                if (sample_rate && sample_rate != entry.sample_rate) {
+                                    entry.sample_rate = *sample_rate;
+                                    signalInfoChanged = true;
+                                }
                             }
                         }
                     }
@@ -258,12 +267,8 @@ private:
                     std::ignore = messages.consume(messages.size());
 
                     if (signalInfoChanged && _updateSignalEntriesCallback) {
-                        std::vector<SignalEntry> entries;
-                        entries.reserve(signalEntryBySink.size());
-                        for (const auto& [_, entry] : signalEntryBySink) {
-                            entries.push_back(entry);
-                        }
-                        _updateSignalEntriesCallback(std::move(entries));
+                        auto flattened = signalEntriesBySink | std::views::values | std::views::join;
+                        _updateSignalEntriesCallback(std::vector(flattened.begin(), flattened.end()));
                     }
 
                     bool pollersFinished = true;
@@ -286,7 +291,7 @@ private:
                     if (_updateSignalEntriesCallback) {
                         _updateSignalEntriesCallback({});
                     }
-                    signalEntryBySink.clear();
+                    signalEntriesBySink.clear();
                     streamingPollers.clear();
                     dataSetPollers.clear();
                     fromScheduler.reset();
@@ -301,21 +306,30 @@ private:
                 }
 
                 if (pendingFlowGraph) {
-                    pendingFlowGraph->forEachBlock([&signalEntryBySink](const auto& block) {
+                    pendingFlowGraph->forEachBlock([&signalEntriesBySink](const auto& block) {
                         if (block.typeName().starts_with("gr::basic::DataSink")) {
-                            auto& entry       = signalEntryBySink[std::string(block.uniqueName())];
+                            auto& entries = signalEntriesBySink[std::string(block.uniqueName())];
+                            entries.resize(1);
+                            auto& entry       = entries[0];
                             entry.name        = detail::getSetting<std::string>(block, "signal_name").value_or("");
                             entry.unit        = detail::getSetting<std::string>(block, "signal_unit").value_or("");
                             entry.sample_rate = detail::getSetting<float>(block, "sample_rate").value_or(1.f);
+                        } else if (block.typeName().starts_with("gr::basic::DataSetSink")) {
+                            auto&      entries = signalEntriesBySink[std::string(block.uniqueName())];
+                            const auto names   = detail::getSetting<std::vector<std::string>>(block, "signal_names").value();
+                            const auto units   = detail::getSetting<std::vector<std::string>>(block, "signal_units").value();
+                            const auto n       = std::min(names.size(), units.size());
+                            entries.resize(n);
+                            for (auto i = 0UZ; i < n; ++i) {
+                                entries[i].name        = names[i];
+                                entries[i].unit        = units[i];
+                                entries[i].sample_rate = 1.f; // no sample rate information available for data sets
+                            }
                         }
                     });
                     if (_updateSignalEntriesCallback) {
-                        std::vector<SignalEntry> entries;
-                        entries.reserve(signalEntryBySink.size());
-                        for (const auto& [_, entry] : signalEntryBySink) {
-                            entries.push_back(entry);
-                        }
-                        _updateSignalEntriesCallback(std::move(entries));
+                        auto flattened = signalEntriesBySink | std::views::values | std::views::join;
+                        _updateSignalEntriesCallback(std::vector(flattened.begin(), flattened.end()));
                     }
                     auto sched          = std::make_unique<scheduler::Simple<scheduler::ExecutionPolicy::multiThreaded>>(std::move(*pendingFlowGraph));
                     toScheduler         = std::make_unique<MsgPortOut>();
@@ -401,8 +415,8 @@ private:
             reply.channelValue.resize(data.size());
             reply.channelError.resize(data.size());
             reply.channelTimeBase.resize(data.size());
-            std::transform(data.begin(), data.end(), reply.channelValue.begin(), detail::doubleToFloat);
-            std::copy(data.begin(), data.end(), reply.channelValue.begin());
+            std::ranges::transform(data, reply.channelValue.begin(), detail::doubleToFloat);
+            std::ranges::copy(data, reply.channelValue.begin());
             std::fill(reply.channelError.begin(), reply.channelError.end(), 0.f);     // TODO
             std::fill(reply.channelTimeBase.begin(), reply.channelTimeBase.end(), 0); // TODO
         };
@@ -446,7 +460,6 @@ private:
                 pollerIt = pollers.emplace(key, basic::DataSinkRegistry::instance().getMultiplexedPoller<double>(query, std::move(matcher), key.maximum_window_size)).first;
             } else if (mode == AcquisitionMode::DataSet) {
                 pollerIt = pollers.emplace(key, basic::DataSinkRegistry::instance().getDataSetPoller<double>(query)).first;
-                fmt::println("got a poller for '{}': {}", signalName, pollerIt->second.poller != nullptr);
             }
         }
         return pollerIt;
@@ -466,7 +479,6 @@ private:
         }
         Acquisition reply;
         auto        processData = [&reply, &key, signalName, &pollerEntry](std::span<const gr::DataSet<double>> dataSets) {
-            fmt::println("received {} datasets", dataSets.size());
             const auto& dataSet = dataSets[0];
             const auto  signal_it = std::ranges::find(dataSet.signal_names, signalName);
             if (key.mode == AcquisitionMode::DataSet && signal_it == dataSet.signal_names.end()) {
@@ -489,10 +501,12 @@ private:
             auto errors = std::span(dataSet.signal_errors);
 
             if (key.mode == AcquisitionMode::DataSet) {
-                const auto samples = static_cast<std::size_t>(dataSet.extents[1]); // TODO any reason why extents is signed? Do I need to handle the < 0 case?
+                const auto samples = static_cast<std::size_t>(dataSet.extents[1]);
                 const auto offset  = signal_idx * samples;
-                values             = values.subspan(offset, samples);
-                errors             = errors.subspan(offset, samples);
+                const auto nValues = offset + samples <= values.size() ? samples : 0;
+                const auto nErrors = offset + samples <= errors.size() ? samples : 0;
+                values             = values.subspan(offset, nValues);
+                errors             = errors.subspan(offset, nErrors);
             }
 
             reply.channelValue.resize(values.size());

@@ -611,7 +611,7 @@ blocks:
         - Im(FFT(test signal))
         - Magnitude(test signal)
         - Phase(test signal)
-connnections:
+connections:
   - [count, 0, delay, 0]
   - [delay, 0, fft, 0]
   - [fft, 0, test_sink, 0]
@@ -623,27 +623,30 @@ connnections:
             }
         });
 
-        std::vector<float>       receivedData;
         std::atomic<std::size_t> receivedCount = 0;
 
-        test.subscribeClient(URI("mds://127.0.0.1:12345/GnuRadio/Acquisition?channelNameFilter=Im%28FFT%28test%20signal%29%29&acquisitionModeFilter=dataset"), [&receivedData, &receivedCount](const auto& acq) {
-            fmt::println("Got a set with {} samples", acq.channelValue.size());
-            expect(acq.acqTriggerName.value() == "start");
-            receivedData.insert(receivedData.end(), acq.channelValue.begin(), acq.channelValue.end());
-            receivedCount = receivedData.size();
+        test.subscribeClient(URI("mds://127.0.0.1:12345/GnuRadio/Acquisition?channelNameFilter=Im%28FFT%28test%20signal%29%29&acquisitionModeFilter=dataset"), [&receivedCount](const auto& acq) {
+            expect(eq(acq.channelValue.size(), 512UZ));
+            expect(eq(acq.channelError.size(), 0UZ));
+            expect(eq(acq.channelName.value(), "Im(FFT(test signal))"sv));
+            expect(eq(acq.channelUnit.value(), "itest unit"sv));
+            receivedCount++;
         });
 
         std::this_thread::sleep_for(50ms);
         test.setGrc(grc);
 
-        waitWhile([&receivedCount] { return receivedCount < 20; });
+        waitWhile([&receivedCount] { return receivedCount < 97UZ; });
+        expect(eq(receivedCount.load(), 97UZ));
 
-        expect(eq(receivedData, getIota(20, 50)));
-        expect(eq(lastDnsEntries.size(), 1UZ));
-        if (!lastDnsEntries.empty()) {
-            expect(eq(lastDnsEntries[0].name, "count"sv));
-            expect(eq(lastDnsEntries[0].unit, "A unit"sv));
-            expect(eq(lastDnsEntries[0].sample_rate, 10.f));
+        std::ranges::sort(lastDnsEntries, {}, &SignalEntry::name);
+
+        expect(eq(lastDnsEntries.size(), 2UZ));
+        if (lastDnsEntries.size() >= 2UZ) {
+            expect(eq(lastDnsEntries[0].name, "count_down"sv));
+            expect(eq(lastDnsEntries[0].unit, "Test unit B"sv));
+            expect(eq(lastDnsEntries[1].name, "count_up"sv));
+            expect(eq(lastDnsEntries[1].unit, "Test unit A"sv));
         }
     };
 
